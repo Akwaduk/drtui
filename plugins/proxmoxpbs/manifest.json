@@ -1,0 +1,138 @@
+{
+  "apiVersion": "drtui.io/plugin/v1alpha1",
+  "kind": "ProviderPlugin",
+  "metadata": {
+    "name": "proxmox-backup-client",
+    "version": "0.1.0",
+    "description": "Reads and restores Proxmox Backup Server snapshots through proxmox-backup-client."
+  },
+  "spec": {
+    "protocolVersion": 1,
+    "capabilities": ["backup"],
+    "configSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["server", "datastore", "authId", "fingerprint", "password", "workDirectory"],
+      "properties": {
+        "clientPath": { "type": "string", "minLength": 1, "default": "proxmox-backup-client" },
+        "server": { "type": "string", "minLength": 1 },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 8007 },
+        "datastore": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$" },
+        "authId": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+(?:![A-Za-z0-9_.-]+)?$" },
+        "namespace": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*(?:/[A-Za-z0-9][A-Za-z0-9_.-]*)*$" },
+        "fingerprint": { "type": "string", "pattern": "^(?:[0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}$" },
+        "password": { "$ref": "#/$defs/secretReference" },
+        "workDirectory": { "type": "string", "minLength": 1 }
+      },
+      "$defs": {
+        "secretReference": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["provider", "key"],
+          "properties": {
+            "provider": { "type": "string", "minLength": 1 },
+            "key": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "actions": {
+      "probeRepository": {
+        "capability": "backup",
+        "sideEffects": "read",
+        "idempotent": true,
+        "retryableErrorCodes": ["TRANSIENT", "TIMEOUT"],
+        "inputSchema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reachable", "totalBytes", "usedBytes", "availableBytes"],
+          "properties": {
+            "reachable": { "type": "boolean" },
+            "serverVersion": { "type": "string" },
+            "totalBytes": { "type": "integer", "minimum": 0 },
+            "usedBytes": { "type": "integer", "minimum": 0 },
+            "availableBytes": { "type": "integer", "minimum": 0 }
+          }
+        }
+      },
+      "listSnapshots": {
+        "capability": "backup",
+        "sideEffects": "read",
+        "idempotent": true,
+        "retryableErrorCodes": ["TRANSIENT", "TIMEOUT"],
+        "inputSchema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "group": { "type": "string", "pattern": "^(?:vm|ct|host)/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$" },
+            "namespace": { "type": "string" }
+          }
+        },
+        "outputSchema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["snapshots"],
+          "properties": { "snapshots": { "type": "array", "items": { "type": "object" } } }
+        }
+      },
+      "listSnapshotFiles": {
+        "capability": "backup",
+        "sideEffects": "read",
+        "idempotent": true,
+        "retryableErrorCodes": ["TRANSIENT", "TIMEOUT"],
+        "inputSchema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["snapshot"],
+          "properties": { "snapshot": { "type": "object" } }
+        },
+        "outputSchema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["archives"],
+          "properties": { "archives": { "type": "array", "items": { "type": "object" } } }
+        }
+      },
+      "restoreArchive": {
+        "capability": "backup",
+        "sideEffects": "write",
+        "idempotent": false,
+        "retryableErrorCodes": ["TRANSIENT", "TIMEOUT", "CONFLICT"],
+        "inputSchema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["snapshot", "archive", "localDestination"],
+          "properties": {
+            "snapshot": { "type": "object" },
+            "archive": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$" },
+            "localDestination": { "type": "string", "minLength": 1 },
+            "overwrite": { "type": "boolean", "default": false }
+          }
+        },
+        "outputSchema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["snapshot", "archive", "localDestination"],
+          "properties": {
+            "snapshot": { "type": "string" },
+            "archive": { "type": "string" },
+            "localDestination": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,333 @@
+syntax = "proto3";
+
+package drtui.provider.v1;
+
+option go_package = "github.com/drtui/drtui/gen/provider/v1;providerv1";
+
+// Every request carries deterministic execution metadata. Transport deadlines
+// and cancellation are propagated independently through gRPC context.
+message Invocation {
+  string run_id = 1;
+  string step_instance_id = 2;
+  string idempotency_key = 3;
+  uint32 attempt = 4;
+}
+
+enum Capability {
+  CAPABILITY_UNSPECIFIED = 0;
+  CAPABILITY_KEYVAULT = 1;
+  CAPABILITY_STORAGE = 2;
+  CAPABILITY_APPLICATION = 3;
+  CAPABILITY_DNS = 4;
+  CAPABILITY_INFRASTRUCTURE = 5;
+  CAPABILITY_BACKUP = 6;
+}
+
+message ActionDescriptor {
+  string name = 1;
+  Capability capability = 2;
+  bytes input_schema_json = 3;
+  bytes output_schema_json = 4;
+  repeated string sensitive_input_json_pointers = 5;
+  repeated string sensitive_output_json_pointers = 6;
+  bool idempotent = 7;
+  repeated string retryable_error_codes = 8;
+}
+
+message ProviderMetadata {
+  string name = 1;
+  string version = 2;
+  uint32 protocol_version = 3;
+  repeated Capability capabilities = 4;
+  bytes config_schema_json = 5;
+  repeated ActionDescriptor actions = 6;
+}
+
+message GetMetadataRequest {
+  uint32 minimum_protocol_version = 1;
+  uint32 maximum_protocol_version = 2;
+  string handshake_token = 3;
+}
+
+message GetMetadataResponse {
+  ProviderMetadata metadata = 1;
+}
+
+message CloseRequest {}
+message CloseResponse {}
+
+service LifecycleService {
+  rpc GetMetadata(GetMetadataRequest) returns (GetMetadataResponse);
+  rpc Close(CloseRequest) returns (CloseResponse);
+}
+
+message AuthConfig {
+  string method = 1;
+  bytes parameters_json = 2;
+}
+
+message InitializeKeyvaultRequest {
+  Invocation invocation = 1;
+  AuthConfig auth_config = 2;
+}
+
+message InitializeKeyvaultResponse {}
+
+message FetchPlanSecretsRequest {
+  Invocation invocation = 1;
+  string plan_id = 2;
+}
+
+message SecretEntry {
+  string key = 1;
+  bytes value = 2;
+}
+
+message FetchPlanSecretsResponse {
+  repeated SecretEntry secrets = 1;
+}
+
+service KeyvaultService {
+  rpc Initialize(InitializeKeyvaultRequest) returns (InitializeKeyvaultResponse);
+  rpc FetchPlanSecrets(FetchPlanSecretsRequest) returns (FetchPlanSecretsResponse);
+}
+
+message DownloadBlobRequest {
+  Invocation invocation = 1;
+  string source_path = 2;
+  string local_destination = 3;
+}
+
+message DownloadBlobResponse {}
+
+service StorageService {
+  rpc DownloadBlob(DownloadBlobRequest) returns (DownloadBlobResponse);
+}
+
+message ProbeBackupRepositoryRequest {
+  Invocation invocation = 1;
+}
+
+message BackupRepositoryStatus {
+  bool reachable = 1;
+  string server_version = 2;
+  uint64 total_bytes = 3;
+  uint64 used_bytes = 4;
+  uint64 available_bytes = 5;
+}
+
+message BackupSnapshotQuery {
+  string group = 1;
+  string namespace = 2;
+}
+
+message BackupSnapshot {
+  string id = 1;
+  string group = 2;
+  int64 timestamp_unix = 3;
+  uint64 size_bytes = 4;
+  repeated string archives = 5;
+}
+
+message ListBackupSnapshotsRequest {
+  Invocation invocation = 1;
+  BackupSnapshotQuery query = 2;
+}
+
+message ListBackupSnapshotsResponse {
+  repeated BackupSnapshot snapshots = 1;
+}
+
+message BackupSnapshotReference {
+  string id = 1;
+  string namespace = 2;
+}
+
+message BackupArchive {
+  string name = 1;
+  uint64 size_bytes = 2;
+  string crypt_mode = 3;
+  string fingerprint = 4;
+}
+
+message ListBackupSnapshotFilesRequest {
+  Invocation invocation = 1;
+  BackupSnapshotReference snapshot = 2;
+}
+
+message ListBackupSnapshotFilesResponse {
+  repeated BackupArchive archives = 1;
+}
+
+message RestoreBackupArchiveRequest {
+  Invocation invocation = 1;
+  BackupSnapshotReference snapshot = 2;
+  string archive = 3;
+  string local_destination = 4;
+  bool overwrite = 5;
+}
+
+message RestoreBackupArchiveResponse {
+  string snapshot = 1;
+  string archive = 2;
+  string local_destination = 3;
+}
+
+service BackupService {
+  rpc ProbeRepository(ProbeBackupRepositoryRequest) returns (BackupRepositoryStatus);
+  rpc ListSnapshots(ListBackupSnapshotsRequest) returns (ListBackupSnapshotsResponse);
+  rpc ListSnapshotFiles(ListBackupSnapshotFilesRequest) returns (ListBackupSnapshotFilesResponse);
+  rpc RestoreArchive(RestoreBackupArchiveRequest) returns (RestoreBackupArchiveResponse);
+}
+
+message SecretReference {
+  string provider = 1;
+  string key = 2;
+}
+
+message BastionConnection {
+  string host = 1;
+  uint32 port = 2;
+  string user = 3;
+  string host_key_sha256 = 4;
+  SecretReference credential = 5;
+}
+
+message SSHConnection {
+  string host = 1;
+  uint32 port = 2;
+  string user = 3;
+  string host_key_sha256 = 4;
+  SecretReference credential = 5;
+  int64 connect_timeout_milliseconds = 6;
+  int64 command_timeout_milliseconds = 7;
+  BastionConnection bastion = 8;
+}
+
+message RuntimeConfig {
+  string kind = 1;
+  string api_version = 2;
+  bytes spec_json = 3;
+}
+
+message BootstrapRuntimeRequest {
+  Invocation invocation = 1;
+  SSHConnection target_host = 2;
+  RuntimeConfig config = 3;
+}
+
+message BootstrapRuntimeResponse {
+  bool ready = 1;
+}
+
+message BackupMetadata {
+  string format = 1;
+  string artifact_path = 2;
+  bytes properties_json = 3;
+}
+
+message NetworkRoute {
+  string domain = 1;
+  string service = 2;
+  uint32 target_port = 3;
+  string path = 4;
+  string protocol = 5;
+}
+
+message NetworkMap {
+  repeated NetworkRoute routes = 1;
+}
+
+message ExtractNetworkTopologyRequest {
+  Invocation invocation = 1;
+  BackupMetadata backup_meta = 2;
+}
+
+message ExtractNetworkTopologyResponse {
+  NetworkMap network_map = 1;
+}
+
+message ServiceDefinition {
+  string id = 1;
+  string kind = 2;
+  string api_version = 3;
+  bytes spec_json = 4;
+}
+
+message DeployServiceRequest {
+  Invocation invocation = 1;
+  ServiceDefinition service_definition = 2;
+}
+
+message DeployServiceResponse {}
+
+service ApplicationLayerService {
+  rpc BootstrapRuntime(BootstrapRuntimeRequest) returns (BootstrapRuntimeResponse);
+  rpc ExtractNetworkTopology(ExtractNetworkTopologyRequest) returns (ExtractNetworkTopologyResponse);
+  rpc DeployService(DeployServiceRequest) returns (DeployServiceResponse);
+}
+
+message SyncRecordsRequest {
+  Invocation invocation = 1;
+  repeated string domain_list = 2;
+  string target_ip = 3;
+  bool proxy_enabled = 4;
+}
+
+message SyncRecordsResponse {}
+
+service DNSLayerService {
+  rpc SyncRecords(SyncRecordsRequest) returns (SyncRecordsResponse);
+}
+
+message ProvisionRequest {
+  Invocation invocation = 1;
+  string target_name = 2;
+  bytes spec_json = 3;
+}
+
+message ProvisionResult {
+  string instance_id = 1;
+  string public_ip = 2;
+  SSHConnection ssh = 3;
+}
+
+message VerifyRequest {
+  Invocation invocation = 1;
+  ProvisionResult target = 2;
+  bytes checks_json = 3;
+}
+
+message VerifyResponse {
+  bool healthy = 1;
+  bytes details_json = 2;
+}
+
+message DestroyRequest {
+  Invocation invocation = 1;
+  ProvisionResult target = 2;
+}
+
+message DestroyResponse {}
+
+service InfrastructureService {
+  rpc Provision(ProvisionRequest) returns (ProvisionResult);
+  rpc Verify(VerifyRequest) returns (VerifyResponse);
+  rpc Destroy(DestroyRequest) returns (DestroyResponse);
+}
+
+// Extension actions remain schema-bound while allowing provider-specific
+// operations such as Coolify environment injection and database health checks.
+message ExecuteActionRequest {
+  Invocation invocation = 1;
+  string action = 2;
+  bytes input_json = 3;
+}
+
+message ExecuteActionResponse {
+  bytes output_json = 1;
+}
+
+service ExtensionActionService {
+  rpc ExecuteAction(ExecuteActionRequest) returns (ExecuteActionResponse);
+}

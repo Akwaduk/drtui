@@ -1,0 +1,150 @@
+# This plan tests the PBS layer in isolation. It authenticates through a
+# keyvault provider, verifies the repository, inventories one VM backup, and
+# restores one archive into the engine work directory. A later Proxmox VE step
+# can consume the exact snapshot ID directly instead of downloading an image.
+apiVersion: drtui.io/v1alpha1
+kind: DisasterRecoveryPlan
+
+metadata:
+  id: proxmox-pbs-restore
+  name: Proxmox Backup Server archive restore
+  version: 0.1.0
+  description: Validate and restore an exact PBS snapshot archive.
+
+inputs:
+  pbs_group:
+    type: string
+    description: Exact PBS backup group; implicit latest selection is forbidden.
+    required: true
+    default: vm/101
+  pbs_snapshot:
+    type: string
+    description: Exact PBS snapshot path selected during incident preparation.
+    required: true
+    default: vm/101/2026-09-21T08:30:00Z
+  pbs_archive:
+    type: string
+    description: Archive within the snapshot to restore locally.
+    required: true
+    default: qemu-server.conf.blob
+
+providers:
+  recovery_secrets:
+    kind: keyvault
+    source: oci://ghcr.io/drtui/aws-secrets-provider
+    version: 1.2.0
+    digest: sha256:1111111111111111111111111111111111111111111111111111111111111111
+    config:
+      region: eu-west-1
+  pbs:
+    kind: backup
+    source: oci://ghcr.io/drtui/proxmox-backup-provider
+    version: 0.1.0
+    digest: sha256:6666666666666666666666666666666666666666666666666666666666666666
+    config:
+      server: pbs.lab.example
+      port: 8007
+      datastore: recovery
+      authId: drtui@pbs!dr
+      namespace: dr
+      fingerprint: AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA
+      password:
+        provider: recovery_secrets
+        key: PBS_API_TOKEN
+      workDirectory: "${{ runtime.workDir.pbs }}"
+
+transactions:
+  pbs_restore:
+    rollback: on-failure
+
+policy:
+  maxParallel: 1
+  failFast: true
+  requireSignatures: true
+  allowUnpinned: false
+  workDirectory: ephemeral
+
+steps:
+  - id: initialize_secrets
+    name: Authenticate to the recovery keyvault
+    uses: recovery_secrets/initialize
+    timeout: 30s
+    with:
+      authConfig:
+        method: aws-cli-profile
+        parameters:
+          profile: disaster-recovery
+
+  - id: fetch_secrets
+    name: Lease the PBS API token
+    uses: recovery_secrets/fetchPlanSecrets
+    needs: [initialize_secrets]
+    timeout: 30s
+    with:
+      planId: proxmox-pbs-restore
+    outputs:
+      pbs_api_token:
+        type: secret
+        from: result.secrets.PBS_API_TOKEN
+        sensitive: true
+
+  - id: probe_pbs
+    name: Verify PBS authentication and repository status
+    uses: pbs/probeRepository
+    needs: [fetch_secrets]
+    timeout: 30s
+    retry:
+      maxAttempts: 2
+      backoff: 2s
+      maxBackoff: 2s
+      jitter: false
+
+  - id: list_snapshots
+    name: Inventory the requested VM backup group
+    uses: pbs/listSnapshots
+    needs: [probe_pbs]
+    timeout: 1m
+    with:
+      group: "${{ inputs.pbs_group }}"
+      namespace: dr
+    outputs:
+      snapshots:
+        type: array
+        from: result.snapshots
+
+  - id: list_snapshot_files
+    name: Inspect archives in the exact snapshot
+    uses: pbs/listSnapshotFiles
+    needs: [list_snapshots]
+    timeout: 1m
+    with:
+      snapshot:
+        id: "${{ inputs.pbs_snapshot }}"
+        namespace: dr
+    outputs:
+      archives:
+        type: array
+        from: result.archives
+
+  - id: restore_archive
+    name: Restore the selected PBS archive
+    uses: pbs/restoreArchive
+    needs: [list_snapshot_files]
+    transaction: pbs_restore
+    timeout: 20m
+    with:
+      snapshot:
+        id: "${{ inputs.pbs_snapshot }}"
+        namespace: dr
+      archive: "${{ inputs.pbs_archive }}"
+      localDestination: "${{ runtime.workDir.pbs-restore }}"
+      overwrite: false
+    outputs:
+      restored_path:
+        type: path
+        from: result.localDestination
+    rollback:
+      uses: engine/removePath
+      timeout: 30s
+      with:
+        path: "${{ steps.restore_archive.outputs.restored_path }}"

@@ -1,0 +1,425 @@
+# This plan restores a Coolify control plane and its workloads onto a fresh host,
+# using backups from S3, then moves Cloudflare DNS to the recovered public IP.
+# Package this file with a generated plugins.lock.json before a live execution.
+apiVersion: drtui.io/v1alpha1
+kind: DisasterRecoveryPlan
+
+metadata:
+  id: coolify-s3-cloudflare
+  name: Coolify recovery from S3 with Cloudflare cutover
+  version: 1.0.0
+  description: Rebuild a Coolify host, restore data, verify it, and swing DNS.
+  labels:
+    environment: production
+    owner: platform
+
+# Inputs are non-secret and become immutable after plan compilation. A caller may
+# override them with --set; the compiler validates the replacement's declared type.
+inputs:
+  target_region:
+    type: string
+    description: Region passed to the Terraform recovery module.
+    default: eu-west-1
+  coolify_state_uri:
+    type: string
+    description: Versioned S3 object containing the Coolify state archive.
+    default: s3://acme-dr/coolify/2026-09-21/control-plane.tar.zst
+  database_snapshot_uri:
+    type: string
+    description: Versioned S3 object containing the PostgreSQL custom dump.
+    default: s3://acme-dr/postgres/2026-09-21/app.dump
+  previous_primary_ip:
+    type: ip
+    description: Last known healthy origin used by the DNS compensation handler.
+    required: true
+    default: 198.51.100.42
+
+# Plugins are immutable inputs. These sample digests are structurally valid
+# placeholders; `drtui plugin lock` replaces them with registry digests.
+providers:
+  aws_secrets:
+    kind: keyvault
+    source: oci://ghcr.io/drtui/aws-secrets-provider
+    version: 1.2.0
+    digest: sha256:1111111111111111111111111111111111111111111111111111111111111111
+    config:
+      region: eu-west-1
+  s3:
+    kind: storage
+    source: oci://ghcr.io/drtui/s3-provider
+    version: 1.3.1
+    digest: sha256:2222222222222222222222222222222222222222222222222222222222222222
+    config:
+      region: eu-west-1
+      checksumMode: required
+  terraform:
+    kind: infrastructure
+    source: oci://ghcr.io/drtui/terraform-provider
+    version: 1.1.0
+    digest: sha256:3333333333333333333333333333333333333333333333333333333333333333
+    config:
+      workingDirectory: artifacts/terraform/recovery-host
+      backendReadOnly: false
+  coolify:
+    kind: application
+    source: oci://ghcr.io/drtui/coolify-provider
+    version: 2.0.0
+    digest: sha256:4444444444444444444444444444444444444444444444444444444444444444
+    config:
+      releaseChannel: stable
+  cloudflare:
+    kind: dns
+    source: oci://ghcr.io/drtui/cloudflare-provider
+    version: 1.4.0
+    digest: sha256:5555555555555555555555555555555555555555555555555555555555555555
+    config:
+      apiToken: "${{ steps.fetch_secrets.outputs.cloudflare_api_token }}"
+      ttlSeconds: 60
+
+# A transaction is compensating, not ACID. Successful mutating steps are undone
+# in reverse topological order if a later member fails.
+transactions:
+  recovery:
+    rollback: on-failure
+
+policy:
+  # One makes the example strictly sequential. Independent steps may run in
+  # parallel in other plans without changing deterministic dispatch order.
+  maxParallel: 1
+  failFast: true
+  requireSignatures: true
+  allowUnpinned: false
+  workDirectory: ephemeral
+
+steps:
+  # Authentication uses the installed AWS CLI profile. No credential is stored
+  # in the plan or package.
+  - id: initialize_secrets
+    name: Authenticate to AWS Secrets Manager
+    uses: aws_secrets/initialize
+    timeout: 30s
+    retry:
+      maxAttempts: 2
+      backoff: 2s
+      maxBackoff: 2s
+      jitter: false
+    with:
+      authConfig:
+        method: aws-cli-profile
+        parameters:
+          profile: disaster-recovery
+
+  # Secret outputs are opaque handles. The journal records only their names and
+  # hashes; the mutable buffers are destroyed after their final consumers exit.
+  - id: fetch_secrets
+    name: Load short-lived recovery secrets
+    uses: aws_secrets/fetchPlanSecrets
+    needs: [initialize_secrets]
+    timeout: 30s
+    with:
+      planId: coolify-s3-cloudflare
+    outputs:
+      coolify_app_key:
+        type: secret
+        from: result.secrets.COOLIFY_APP_KEY
+        sensitive: true
+      cloudflare_api_token:
+        type: secret
+        from: result.secrets.CLOUDFLARE_API_TOKEN
+        sensitive: true
+
+  # Terraform returns a typed target object, public IP, and SSH connection with
+  # a host-key fingerprint obtained through the cloud control plane.
+  - id: provision_target
+    name: Provision the replacement host
+    uses: terraform/provision
+    needs: [fetch_secrets]
+    transaction: recovery
+    timeout: 20m
+    retry:
+      maxAttempts: 1
+      jitter: false
+    with:
+      request:
+        targetName: coolify-recovery-primary
+        spec:
+          region: "${{ inputs.target_region }}"
+          module: recovery_host
+          variables:
+            immutableImage: ubuntu-24.04-20260915
+            instanceType: c7i.xlarge
+    outputs:
+      target:
+        type: object
+        from: result.target
+      public_ip:
+        type: ip
+        from: result.publicIp
+      ssh:
+        type: object
+        from: result.ssh
+    rollback:
+      uses: terraform/destroy
+      timeout: 20m
+      retry:
+        maxAttempts: 2
+        backoff: 10s
+        maxBackoff: 10s
+        jitter: false
+      with:
+        target: "${{ steps.provision_target.outputs.target }}"
+
+  - id: verify_target
+    name: Verify host reachability and prerequisites
+    uses: terraform/verify
+    needs: [provision_target]
+    transaction: recovery
+    timeout: 5m
+    with:
+      request:
+        target: "${{ steps.provision_target.outputs.target }}"
+        checks:
+          ssh: true
+          minimumDiskGiB: 200
+          requiredTcpEgress: [443]
+    outputs:
+      healthy:
+        type: boolean
+        from: result.healthy
+
+  # Downloads are checksum-verified and confined below the engine work root.
+  - id: download_coolify_state
+    name: Download Coolify control-plane state
+    uses: s3/downloadBlob
+    needs: [verify_target]
+    transaction: recovery
+    timeout: 15m
+    retry:
+      maxAttempts: 3
+      backoff: 5s
+      maxBackoff: 20s
+      jitter: false
+    with:
+      sourcePath: "${{ inputs.coolify_state_uri }}"
+      localDestination: "${{ runtime.workDir.coolify-state }}"
+    rollback:
+      uses: engine/removePath
+      timeout: 30s
+      with:
+        path: "${{ runtime.workDir.coolify-state }}"
+
+  - id: download_database_snapshot
+    name: Download PostgreSQL snapshot
+    uses: s3/downloadBlob
+    needs: [download_coolify_state]
+    transaction: recovery
+    timeout: 30m
+    retry:
+      maxAttempts: 3
+      backoff: 5s
+      maxBackoff: 20s
+      jitter: false
+    with:
+      sourcePath: "${{ inputs.database_snapshot_uri }}"
+      localDestination: "${{ runtime.workDir.database-dump }}"
+    rollback:
+      uses: engine/removePath
+      timeout: 30s
+      with:
+        path: "${{ runtime.workDir.database-dump }}"
+
+  - id: bootstrap_runtime
+    name: Bootstrap a clean Coolify control plane
+    uses: coolify/bootstrapRuntime
+    needs: [download_database_snapshot]
+    transaction: recovery
+    timeout: 20m
+    with:
+      targetHost: "${{ steps.provision_target.outputs.ssh }}"
+      config:
+        kind: coolify-runtime
+        apiVersion: v1
+        spec:
+          stateArchive: "${{ runtime.workDir.coolify-state }}"
+          disablePublicIngressUntilCutover: true
+    outputs:
+      ready:
+        type: boolean
+        from: result.ready
+    rollback:
+      uses: coolify/destroyRuntime
+      timeout: 10m
+      with:
+        targetHost: "${{ steps.provision_target.outputs.ssh }}"
+
+  # This provider-specific action is schema-advertised by the Coolify plugin.
+  # It writes an SSH environment override without invoking a shell parser.
+  - id: inject_system_config
+    name: Inject the original Coolify encryption key
+    uses: coolify/injectEnvironment
+    needs: [bootstrap_runtime]
+    transaction: recovery
+    timeout: 2m
+    with:
+      targetHost: "${{ steps.provision_target.outputs.ssh }}"
+      destination: /etc/systemd/system/coolify.service.d/20-recovery.conf
+      mode: "0600"
+      environment:
+        APP_KEY: "${{ steps.fetch_secrets.outputs.coolify_app_key }}"
+      daemonReload: true
+      restart: true
+    rollback:
+      uses: coolify/removeEnvironmentOverride
+      timeout: 2m
+      with:
+        targetHost: "${{ steps.provision_target.outputs.ssh }}"
+        destination: /etc/systemd/system/coolify.service.d/20-recovery.conf
+        daemonReload: true
+        restart: true
+
+  - id: restore_database
+    name: Restore the application database
+    uses: coolify/deployService
+    needs: [inject_system_config]
+    transaction: recovery
+    timeout: 30m
+    with:
+      serviceDefinition:
+        id: primary-postgres
+        kind: postgresql-restore
+        apiVersion: coolify.drtui.io/v1
+        spec:
+          snapshot: "${{ runtime.workDir.database-dump }}"
+          database: application
+          cleanBeforeRestore: true
+    rollback:
+      uses: coolify/removeService
+      timeout: 10m
+      with:
+        serviceId: primary-postgres
+        deleteVolumes: true
+
+  # The query is read-only and the plugin verifies both connectivity and schema.
+  - id: ping_database_schema
+    name: Verify the restored database schema
+    uses: coolify/pingDatabase
+    needs: [restore_database]
+    transaction: recovery
+    timeout: 90s
+    retry:
+      maxAttempts: 5
+      backoff: 5s
+      maxBackoff: 20s
+      jitter: false
+    with:
+      serviceId: primary-postgres
+      database: application
+      query: SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1
+      expectedColumns: [version]
+
+  # This is the core application interface method. The provider inspects the
+  # restored metadata and returns a typed NetworkMap plus its domain projection.
+  - id: extract_topology
+    name: Discover routes from the Coolify backup
+    uses: coolify/extractNetworkTopology
+    needs: [ping_database_schema]
+    transaction: recovery
+    timeout: 2m
+    with:
+      backupMeta:
+        format: coolify-state-v2
+        artifactPath: "${{ runtime.workDir.coolify-state }}"
+        properties:
+          includeDisabled: false
+    outputs:
+      network_map:
+        type: network-map
+        from: result.networkMap
+      domains:
+        type: domain-list
+        from: result.domains
+
+  # Service definitions are kept separate from NetworkMap. Provider-specific
+  # discovery remains extensible while deployService retains a strict core type.
+  - id: discover_services
+    name: Discover application definitions from backup metadata
+    uses: coolify/extractServiceDefinitions
+    needs: [extract_topology]
+    transaction: recovery
+    timeout: 2m
+    with:
+      artifactPath: "${{ runtime.workDir.coolify-state }}"
+    outputs:
+      services:
+        type: array
+        from: result.services
+
+  # forEach expands in source-array order. Every child receives one typed item
+  # and gets its own deterministic ID and rollback snapshot.
+  - id: deploy_services
+    name: Deploy each discovered Coolify service
+    uses: coolify/deployService
+    needs: [discover_services]
+    transaction: recovery
+    forEach: "${{ steps.discover_services.outputs.services }}"
+    timeout: 20m
+    with:
+      serviceDefinition: "${{ item.value }}"
+    rollback:
+      uses: coolify/removeService
+      timeout: 10m
+      with:
+        serviceId: "${{ item.value.id }}"
+        deleteVolumes: false
+
+  - id: verify_applications
+    name: Verify every recovered origin locally
+    uses: coolify/verifyRoutes
+    needs: [deploy_services]
+    transaction: recovery
+    timeout: 5m
+    with:
+      targetHost: "${{ steps.provision_target.outputs.ssh }}"
+      networkMap: "${{ steps.extract_topology.outputs.network_map }}"
+      expectedStatus: [200, 204, 301, 302]
+
+  # DNS is changed only after host, database, and application checks pass. The
+  # old IP is snapshotted in the rollback payload before this action starts.
+  - id: sync_dns
+    name: Swing Cloudflare records to the recovered host
+    uses: cloudflare/syncRecords
+    needs: [verify_applications]
+    transaction: recovery
+    timeout: 5m
+    retry:
+      maxAttempts: 3
+      backoff: 5s
+      maxBackoff: 20s
+      jitter: false
+    with:
+      domainList: "${{ steps.extract_topology.outputs.domains }}"
+      targetIp: "${{ steps.provision_target.outputs.public_ip }}"
+      proxyEnabled: true
+    rollback:
+      uses: cloudflare/syncRecords
+      timeout: 5m
+      with:
+        domainList: "${{ steps.extract_topology.outputs.domains }}"
+        targetIp: "${{ inputs.previous_primary_ip }}"
+        proxyEnabled: true
+
+  - id: verify_dns
+    name: Verify authoritative DNS and proxied health
+    uses: cloudflare/verifyRecords
+    needs: [sync_dns]
+    transaction: recovery
+    timeout: 5m
+    retry:
+      maxAttempts: 6
+      backoff: 10s
+      maxBackoff: 30s
+      jitter: false
+    with:
+      domainList: "${{ steps.extract_topology.outputs.domains }}"
+      expectedTargetIp: "${{ steps.provision_target.outputs.public_ip }}"
+      requireProxy: true
